@@ -1,0 +1,1604 @@
+# Operating Systems — Complete Deep Dive
+
+---
+
+## Tier 1 — Must Know Extremely Well
+
+---
+
+## 1. Processes & Threads
+
+### Program vs Process vs Thread
+
+A **program** is just bytes sitting on disk. Passive. A recipe written on paper.
+
+A **process** is what happens when you execute that program. The OS loads it into memory, gives it resources (CPU time, memory, file handles), and tracks its execution. The recipe being cooked.
+
+A **thread** is a unit of execution *within* a process. Multiple threads share the same code, data segment, and heap — but each has its own stack and register set.
+
+Think of a process as a factory. Threads are workers inside it. All workers share the same building, same tools, same raw materials — but each has their own to-do list (stack) of what they're currently doing.
+
+---
+
+### Process Control Block (PCB)
+
+The PCB is the OS's ID card for every process. When a process is created, the OS allocates a PCB for it. It lives in kernel memory.
+
+What's inside:
+
+- **PID** — unique process identifier
+- **Process state** — Running, Ready, Waiting, etc.
+- **Program Counter (PC)** — address of the next instruction to execute
+- **CPU registers** — all register values (general-purpose, stack pointer, flags)
+- **Scheduling info** — priority, queue pointers
+- **Memory management info** — page table base address, segment table
+- **Accounting info** — CPU time consumed, time limits, job number
+- **I/O status** — list of open files, I/O devices in use
+
+The PCB is *why context switching works*. When the OS kicks a process off the CPU, it snapshots the entire CPU register state into the PCB. When the process gets the CPU back, the OS restores everything from the PCB — the process has no idea it was paused.
+
+---
+
+### Process States
+
+```
+New → Ready ⇄ Running → Terminated
+               ↕
+             Waiting
+```
+
+- **New**: Being created, PCB allocated
+- **Ready**: In memory, all set to run, waiting for CPU
+- **Running**: Currently executing on CPU (only one process per core at a time)
+- **Waiting (Blocked)**: Waiting for an event — I/O completion, signal, child to finish
+- **Terminated**: Done. PCB not yet cleaned up until parent calls `wait()`
+
+Key transitions:
+- Ready → Running: **dispatched** by the scheduler
+- Running → Ready: **preempted** by timer interrupt or higher priority arrival
+- Running → Waiting: process made a blocking system call (read from disk, etc.)
+- Waiting → Ready: I/O completed, event occurred
+- Running → Terminated: process called `exit()`
+
+---
+
+### Context Switching
+
+When the OS switches from process A to process B:
+
+1. Timer interrupt fires (or blocking syscall)
+2. CPU saves minimal state, jumps to interrupt handler
+3. OS saves ALL of A's register state into A's PCB
+4. Updates A's state to Ready or Waiting
+5. Scheduler picks B
+6. OS restores B's register state from B's PCB
+7. Updates B's state to Running
+8. CPU jumps to B's saved Program Counter
+
+**This is pure overhead.** Zero useful work happens during a context switch. Modern context switches take ~1–10 microseconds, but the real cost is cache pollution — A's data was in cache, now B needs its own data.
+
+What triggers a context switch: timer interrupt (time quantum expired), blocking system call, higher-priority process becoming ready, or voluntary yield.
+
+---
+
+### Process Creation & Termination
+
+**Unix fork/exec model:**
+
+When you type `ls` in bash:
+
+1. bash calls `fork()` — OS creates an exact copy of the bash process
+2. The child process (copy of bash) calls `exec("ls")` — replaces its memory with the `ls` program
+3. `ls` runs, finishes, calls `exit()`
+4. bash (parent) calls `wait()` — collects the child's exit code, reaps the PCB
+
+Why this design? Between `fork()` and `exec()`, the child can set up file descriptors, change working directory, set environment variables — all before becoming the target program. Elegant.
+
+**Zombie process**: Child has exited but parent hasn't called `wait()` yet. PCB hangs around holding the exit code. In servers, if the parent never calls wait(), zombies pile up.
+
+**Orphan process**: Parent exits before child. The child gets re-parented to PID 1 (`init` or `systemd`), which periodically calls `wait()`.
+
+---
+
+### User Threads vs Kernel Threads
+
+**User threads** — managed entirely by a userspace library. The kernel sees only one process regardless of how many threads exist.
+
+Pros: Thread create/switch doesn't require a system call — very fast.
+Cons: If any thread makes a blocking I/O call, the kernel blocks the entire process. Can't run truly in parallel on multiple cores.
+
+**Kernel threads** — the OS knows about each thread, schedules them independently.
+
+Pros: One thread blocking doesn't block others. True parallelism on multi-core.
+Cons: Thread operations require system calls (slower). More kernel memory per thread.
+
+Linux uses **one-to-one mapping**: every thread (`pthread`) is a kernel-level task (`clone()` with shared address space). This is why Linux threads are sometimes called "lightweight processes."
+
+---
+
+### Concurrency vs Parallelism
+
+**Concurrency**: Multiple tasks making *progress* over time by interleaving. Can happen on a single core — the CPU switches fast enough that things *appear* simultaneous.
+
+**Parallelism**: Multiple tasks *actually executing simultaneously* on multiple cores.
+
+You can have concurrency without parallelism (single core, many threads). You can have parallelism with concurrency (multi-core, many threads). You can even have parallelism without concurrency (SIMD vector operations), though it's unusual in this context.
+
+---
+
+### 🎯 Interview Tips
+
+**Why are threads cheaper than processes?**
+
+Process creation (`fork`) copies memory mappings, duplicates file descriptor tables, sets up a new address space — it's a heavyweight operation. Thread creation just allocates a new stack (usually ~1-8MB) and a register set. Everything else is shared. Context switching between threads in the same process is also cheaper because there's no address space switch — page tables don't change — so TLB entries remain valid on many architectures.
+
+**What exactly happens during a context switch?**
+
+A timer fires (or blocking call occurs). The CPU saves minimal state and jumps to the OS interrupt handler. The OS saves all the current process's registers (including PC, stack pointer, general-purpose registers) into its PCB. The scheduler picks the next process. The OS restores that process's registers from its PCB. The CPU resumes execution at the restored PC. The invisible cost is cache and TLB warming — the new process's working set isn't in cache yet.
+
+**What does a PCB contain?**
+
+PID, process state, program counter, all CPU register values, scheduling info (priority, queue pointers), memory management info (page table address), accounting info (CPU time used), and I/O status (open file descriptors, allocated devices).
+
+---
+
+## 2. CPU Scheduling ⭐
+
+The scheduler decides which process gets the CPU next. It runs when a process terminates, blocks, or (in preemptive systems) when a timer fires.
+
+### Key Metrics
+
+- **Waiting time**: Total time spent sitting in the ready queue
+- **Turnaround time**: Completion time − Arrival time (full end-to-end time)
+- **Response time**: Arrival time to first time on CPU (critical for interactive systems)
+- **Throughput**: Processes completed per unit time
+
+---
+
+### FCFS — First Come First Served
+
+Non-preemptive. Processes get the CPU in arrival order. Simple.
+
+The **convoy effect** kills performance: one long process blocks everything behind it.
+
+```
+Process  Arrival  Burst
+P1         0       24
+P2         1        3
+P3         2        3
+
+Gantt: [P1: 0-24][P2: 24-27][P3: 27-30]
+Waiting: P1=0, P2=23, P3=25 → Average = 16
+```
+
+---
+
+### SJF — Shortest Job First
+
+Non-preemptive. When CPU is free, pick the process with the shortest next burst. Mathematically optimal for minimizing average waiting time.
+
+Problem: We don't know burst times in advance. Solution: **exponential averaging** to predict:
+
+```
+τ(n+1) = α × t(n) + (1−α) × τ(n)
+```
+
+Where `t(n)` = actual burst, `τ(n)` = previous prediction. Typically α = 0.5.
+
+---
+
+### SRTF — Shortest Remaining Time First
+
+Preemptive SJF. When a new process arrives, if its burst < the remaining time of the current process — preempt.
+
+Full worked example:
+
+```
+Process  Arrival  Burst
+P1         0        7
+P2         2        4
+P3         4        1
+P4         5        4
+
+t=0: P1 runs (remaining: 7)
+t=2: P2 arrives. P2 burst(4) < P1 remaining(5) → P2 preempts P1
+t=4: P3 arrives. P3 burst(1) < P2 remaining(2) → P3 preempts P2
+t=5: P3 done. P4 arrives. P2 remaining=2, P4 burst=4 → P2 runs
+t=7: P2 done. P4 runs (4), P1 remaining(5) → P4 runs
+t=11: P4 done. P1 runs.
+t=16: P1 done.
+
+Gantt: [P1:0-2][P2:2-4][P3:4-5][P2:5-7][P4:7-11][P1:11-16]
+
+Completion: P1=16, P2=7, P3=5, P4=11
+Turnaround (CT - AT): P1=16, P2=5, P3=1, P4=6 → Avg = 7
+Waiting (TAT - Burst): P1=9, P2=1, P3=0, P4=2 → Avg = 3
+```
+
+---
+
+### Round Robin
+
+Each process gets a fixed **time quantum** q. When it expires, the process is preempted and added to the back of the ready queue.
+
+Good for: Time-sharing, fairness, response time.
+
+If q is too small: context switch overhead dominates. If q is too large: degenerates to FCFS. Rule of thumb: q should be large enough that ~80% of CPU bursts finish within one quantum.
+
+```
+P1=5, P2=3, P3=4, q=4, all arrive at t=0
+
+Gantt: [P1:0-4][P2:4-7][P3:7-11][P1:11-12]
+
+Waiting: P1=6, P2=4, P3=7 → Avg = 5.67
+```
+
+---
+
+### Priority Scheduling
+
+Each process has a priority. Highest priority runs first. Can be preemptive or non-preemptive.
+
+**Starvation**: Low-priority processes can wait forever if high-priority processes keep arriving.
+
+**Aging**: Gradually increment the priority of waiting processes over time. Prevents starvation.
+
+---
+
+### Preemptive vs Non-Preemptive
+
+Non-preemptive: Once the CPU is given to a process, it keeps it until it voluntarily gives it up (blocks or exits). Simpler.
+
+Preemptive: OS can forcibly take the CPU away (requires a hardware timer). Necessary for interactive and real-time systems.
+
+---
+
+### 🎯 Interview Tips
+
+**What's the optimal algorithm for minimum average waiting time?**
+
+SJF (non-preemptive) and SRTF (preemptive) are provably optimal. But they require knowing burst times in advance, which is impossible in practice.
+
+**Why is RR's quantum size critical?**
+
+Too small: excessive context switches dominate, less real work done. Too large: becomes FCFS, poor response time for short processes. Tune it based on typical burst distribution.
+
+**Difference between response time and waiting time?**
+
+Response time = from arrival to the first time the process touches the CPU. Waiting time = total time spent in the ready queue (summed across all preemptions). For interactive systems, response time matters more. For batch, average waiting/turnaround matters.
+
+---
+
+## 3. Synchronization ⭐⭐⭐
+
+Build the intuition carefully — this is where most candidates struggle.
+
+### The Root Problem: Race Conditions
+
+Multiple threads access shared data concurrently, and the outcome depends on the *order* of execution — which is non-deterministic.
+
+Classic example — bank balance:
+
+```
+Thread 1: balance = balance + 100
+Thread 2: balance = balance - 50
+```
+
+Looks fine. But at the machine level, `balance = balance + 100` is three operations: LOAD, ADD, STORE. The scheduler can interleave these:
+
+```
+Thread 1: LOAD R1 ← balance    ; R1 = 1000
+Thread 1: ADD  R1, 100          ; R1 = 1100
+           ← CONTEXT SWITCH →
+Thread 2: LOAD R1 ← balance    ; R1 = 1000 (still old!)
+Thread 2: SUB  R1, 50           ; R1 = 950
+Thread 2: STORE balance ← R1   ; balance = 950
+           ← CONTEXT SWITCH →
+Thread 1: STORE balance ← R1   ; balance = 1100 ← WRONG
+```
+
+Correct answer: 1050. We got 1100. A race condition.
+
+---
+
+### Critical Section
+
+A **critical section** is a code segment that accesses shared data and must not be executed by more than one thread at a time.
+
+A correct solution to the critical section problem must satisfy three properties:
+
+1. **Mutual Exclusion**: Only one process in its CS at a time
+2. **Progress**: If no process is in the CS and processes want to enter, the decision cannot be postponed indefinitely. Processes *outside* the CS cannot block others.
+3. **Bounded Waiting**: After a process requests entry to the CS, there's a bound on how many times other processes can enter before it does. No starvation.
+
+---
+
+### Mutex
+
+The simplest synchronization primitive. Binary state: locked or unlocked.
+
+```
+lock(mutex)
+    [critical section]
+unlock(mutex)
+```
+
+`lock()`: If unlocked, acquire it and proceed. If locked, **sleep** until it's released.
+`unlock()`: Release, wake up one waiting thread.
+
+The `lock()` and `unlock()` operations themselves must be atomic — guaranteed by hardware.
+
+**Ownership**: A mutex has an owner. Only the thread that locked it can unlock it. This is the key difference from a semaphore.
+
+---
+
+### Semaphore
+
+An integer variable with two atomic operations:
+
+**`wait(S)` / P(S):**
+```
+if S > 0: S--
+else: block (add to S's queue)
+```
+
+**`signal(S)` / V(S):**
+```
+S++
+if (threads waiting): wake one up
+```
+
+**Binary semaphore** (0 or 1): Functions like a mutex, but without ownership — any thread can signal it.
+
+**Counting semaphore** (0 to N): Used to manage N identical resources. Initialize to N. Each `wait()` acquires one resource, each `signal()` releases one. E.g., three printers: semaphore initialized to 3.
+
+---
+
+### Spinlock
+
+A lock where `lock()` busy-waits instead of blocking:
+
+```
+while (test_and_set(&lock) == 1)
+    ;  // spin
+```
+
+Good for: Very short critical sections on multi-core where sleeping + waking is more expensive than spinning for a few nanoseconds.
+
+Bad for: Long waits (burns CPU), single-core (the lock holder can't even run while you spin on the same CPU).
+
+In the Linux kernel, spinlocks are used everywhere because kernel code often can't sleep.
+
+---
+
+### Monitor & Condition Variables
+
+A **monitor** is a higher-level construct: a class where all methods are mutually exclusive. Only one thread can execute *any* method at a time. Java's `synchronized` implements this.
+
+**Condition variables** let threads wait inside a monitor for a specific condition:
+
+- `wait(cv)`: Atomically releases the monitor lock and sleeps. When woken, re-acquires the lock before returning.
+- `signal(cv)`: Wakes one waiting thread.
+- `broadcast(cv)`: Wakes all waiting threads.
+
+The atomic release-and-sleep of `wait()` is critical. If you released the lock and then slept as two separate steps, another thread could signal between them — and you'd miss the signal and sleep forever.
+
+---
+
+### Producer-Consumer (Bounded Buffer)
+
+Buffer of size N. Producer adds items, consumer removes them.
+
+```
+Semaphores:
+  mutex = 1     (protect buffer access)
+  empty = N     (count of empty slots — producer waits here)
+  full  = 0     (count of full slots — consumer waits here)
+
+Producer:
+  wait(empty)       ← must come BEFORE wait(mutex)
+  wait(mutex)
+  [add item to buffer]
+  signal(mutex)
+  signal(full)
+
+Consumer:
+  wait(full)        ← must come BEFORE wait(mutex)
+  wait(mutex)
+  [remove item from buffer]
+  signal(mutex)
+  signal(empty)
+```
+
+**Why must `wait(empty)` come before `wait(mutex)`?** If the producer calls `wait(mutex)` first, then `wait(empty)`: it holds the mutex while waiting for empty slots. The consumer needs the mutex to create empty slots. Deadlock. Always acquire resource semaphores *before* the mutex.
+
+---
+
+### Readers-Writers
+
+Multiple readers can read concurrently. Writers need exclusive access.
+
+```
+int read_count = 0
+Semaphore: mutex = 1, db = 1
+
+Reader:
+  wait(mutex)
+  read_count++
+  if read_count == 1: wait(db)  // first reader blocks writers
+  signal(mutex)
+  [READ]
+  wait(mutex)
+  read_count--
+  if read_count == 0: signal(db)  // last reader unblocks writers
+  signal(mutex)
+
+Writer:
+  wait(db)
+  [WRITE]
+  signal(db)
+```
+
+Problem: If readers continuously arrive, writers starve (readers-preference). The second variant (writers-preference) can starve readers. A fair third variant uses additional semaphores.
+
+---
+
+### Dining Philosophers
+
+5 philosophers, round table, 5 chopsticks between them. Each needs two chopsticks to eat.
+
+Naive solution:
+```
+think()
+pick up left chopstick
+pick up right chopstick
+eat()
+put down both
+```
+
+**This deadlocks**: All five simultaneously pick up their left chopstick, then all wait for the right — circular wait.
+
+Solutions:
+
+1. **Asymmetric**: Odd-numbered philosophers pick left first, even-numbered pick right first. Breaks symmetry, prevents circular wait.
+2. **At most 4 philosophers** try simultaneously (one always blocked before picking up).
+3. **Pick both atomically** using a mutex around the pair of picks.
+4. **Resource ordering**: Label chopsticks 1-5, always pick lower-numbered first.
+
+---
+
+### 🎯 Interview Tips
+
+**Mutex vs Semaphore?**
+
+Mutex has ownership — only the locking thread can unlock it. A semaphore is a signaling mechanism with no ownership — any thread can signal it. Mutex value is always 0 or 1. Semaphore can go above 1 (counting semaphore). Use mutex for mutual exclusion, semaphore for signaling between threads.
+
+**Spinlock vs Mutex?**
+
+Spinlock burns CPU cycles waiting. Mutex sleeps (OS schedules another thread). Spinlock wins when waits are very short and on multi-core (avoid scheduling overhead). Mutex wins when waits are long (why waste a CPU?). In kernel code, spinlocks dominate because sleeping in interrupt context isn't allowed.
+
+**Why put resource semaphore before mutex in producer-consumer?**
+
+Because holding a mutex while waiting on a resource semaphore = deadlock. The rule: lock ordering. Acquire locks in a consistent order across all threads.
+
+**What is a race condition and when does it occur?**
+
+When the outcome of concurrent execution depends on the exact interleaving of operations, and at least one access is a write. Read-modify-write sequences on shared data without synchronization are the classic case.
+
+---
+
+## 4. Deadlocks ⭐⭐⭐
+
+### What is Deadlock?
+
+A set of processes is deadlocked when each process in the set is waiting for an event that can only be caused by another process in the set — and nothing can ever proceed.
+
+---
+
+### Four Necessary Conditions
+
+ALL four must hold simultaneously:
+
+1. **Mutual Exclusion**: At least one resource is non-shareable (only one process at a time can use it)
+2. **Hold and Wait**: A process is holding at least one resource and waiting to acquire more resources held by others
+3. **No Preemption**: Resources can't be forcibly taken away — a process releases them voluntarily only
+4. **Circular Wait**: There exists a set {P1, P2, ..., Pn} where P1 waits for P2, P2 waits for P3, ..., Pn waits for P1
+
+Eliminate any one condition — deadlock cannot occur.
+
+---
+
+### Resource Allocation Graph (RAG)
+
+Circles = processes. Squares = resources (dots inside = instances).
+Request edge: P → R (process wants an instance of R).
+Assignment edge: R → P (instance of R is assigned to P).
+
+**Single-instance resources**: A cycle in the RAG ⟺ deadlock (necessary and sufficient).
+
+**Multi-instance resources**: A cycle is necessary but *not sufficient*. Must use Banker's Algorithm to determine deadlock.
+
+---
+
+### Deadlock Prevention
+
+Eliminate one condition:
+
+- **Attack mutual exclusion**: Make resources shareable. Often impossible (mutexes, printers).
+- **Attack hold and wait**: Require all resources to be requested at process start (or release all before requesting more). Leads to low utilization and starvation.
+- **Attack no preemption**: If a process can't get a resource, release all it holds. Works for preemptable resources (CPU, memory). Fails for non-preemptable (printers, mutexes in use).
+- **Attack circular wait**: Impose a total ordering on all resource types. Processes may only request resources in increasing order of the enumeration. This provably prevents circular wait.
+
+---
+
+### Deadlock Avoidance — Banker's Algorithm
+
+Requires knowing the **maximum claim** of each process in advance. On each resource request, check: "If I grant this, does the system remain in a safe state?"
+
+**Safe state**: A state where there exists a **safe sequence** — an ordering P1, P2, ..., Pn such that each Pi's resource needs can be satisfied by the currently available resources plus all resources held by Pj (j < i).
+
+Data structures (m resource types, n processes):
+```
+Available[m]       — currently free instances of each resource
+Max[n][m]          — maximum demand of each process
+Allocation[n][m]   — currently allocated to each process
+Need[n][m]         — Max - Allocation (remaining need)
+```
+
+**Safety Algorithm:**
+```
+Work = Available  (copy)
+Finish[i] = false for all i
+
+Repeat:
+  Find i where Finish[i] == false AND Need[i] ≤ Work
+  If found:
+    Work = Work + Allocation[i]
+    Finish[i] = true
+
+If all Finish[i] == true: SAFE. Else: UNSAFE.
+```
+
+**Resource-Request Algorithm:**
+When process Pi requests Request[i]:
+```
+If Request[i] > Need[i]: error
+If Request[i] > Available: wait
+
+Tentatively grant:
+  Available    -= Request[i]
+  Allocation[i] += Request[i]
+  Need[i]       -= Request[i]
+
+Run Safety Algorithm:
+  If SAFE: grant permanently
+  If UNSAFE: rollback, make Pi wait
+```
+
+**Full Worked Example:**
+
+Resources: A=10, B=5, C=7
+
+```
+         Alloc      Max       Need
+         A  B  C   A  B  C   A  B  C
+P0:      0  1  0   7  5  3   7  4  3
+P1:      2  0  0   3  2  2   1  2  2
+P2:      3  0  2   9  0  2   6  0  0
+P3:      2  1  1   2  2  2   0  1  1
+P4:      0  0  2   4  3  3   4  3  1
+
+Total allocated: A=7, B=2, C=5
+Available = [10,5,7] - [7,2,5] = [3,3,2]
+```
+
+Safety check (Work starts at [3,3,2]):
+
+```
+P1: Need=[1,2,2] ≤ [3,3,2]? YES
+    Work = [3,3,2] + [2,0,0] = [5,3,2]. Finish[1]=true
+
+P3: Need=[0,1,1] ≤ [5,3,2]? YES
+    Work = [5,3,2] + [2,1,1] = [7,4,3]. Finish[3]=true
+
+P4: Need=[4,3,1] ≤ [7,4,3]? YES
+    Work = [7,4,3] + [0,0,2] = [7,4,5]. Finish[4]=true
+
+P0: Need=[7,4,3] ≤ [7,4,5]? YES
+    Work = [7,4,5] + [0,1,0] = [7,5,5]. Finish[0]=true
+
+P2: Need=[6,0,0] ≤ [7,5,5]? YES. Finish[2]=true
+```
+
+Safe sequence: **P1 → P3 → P4 → P0 → P2**. System is safe.
+
+---
+
+### Deadlock Detection & Recovery
+
+If you don't prevent or avoid: detect after the fact and recover.
+
+**Detection (multi-instance)**: Same as safety algorithm but replace `Need` with `Request` (actual current requests). If the algorithm can't find a sequence to complete all processes, those stuck are deadlocked.
+
+**Recovery options:**
+
+- **Process termination**: Kill all deadlocked processes (drastic), or kill one-by-one until the cycle is broken (choose victim by priority, CPU time used, resources held).
+- **Resource preemption**: Take resources from some processes, roll back to a safe state. Problems: which victim? rollback mechanism? may cause starvation.
+
+---
+
+### 🎯 Interview Tips
+
+**Four conditions for deadlock?**
+
+Mutual exclusion, hold and wait, no preemption, circular wait. All four must hold simultaneously. Removing any one prevents deadlock.
+
+**Prevention vs Avoidance vs Detection?**
+
+Prevention: Statically ensure one condition can never hold (e.g., enforce resource ordering). Avoidance: Dynamically check each request — grant only if system stays safe (Banker's). Detection: Allow deadlocks to occur, detect them periodically, recover.
+
+**What is a safe state?**
+
+A state from which the OS can find a safe sequence — an ordering where each process can eventually get its maximum resources using what's currently available plus what earlier processes in the sequence will release.
+
+**Can the system be in a safe state and still deadlock?**
+
+No. A safe state by definition means all processes can complete. An unsafe state *may* lead to deadlock but doesn't guarantee it — depends on future requests.
+
+---
+
+## 5. Memory Management ⭐⭐⭐
+
+### The Core Problem
+
+The CPU generates addresses. Those addresses need to map to physical RAM. Multiple processes must coexist without interfering with each other.
+
+---
+
+### Logical vs Physical Address
+
+- **Logical address** (virtual address): What the CPU generates. The process *believes* it owns addresses 0 to some maximum.
+- **Physical address**: Actual location in RAM chips.
+
+The **MMU (Memory Management Unit)** is hardware that translates logical → physical on every single memory access.
+
+This translation is what lets ten processes each think their code starts at address 0. They're just seeing different mappings of the same physical RAM.
+
+---
+
+### Contiguous Allocation (Early Systems)
+
+Each process gets a single contiguous chunk of RAM. Simple. Two problems:
+
+**Internal fragmentation**: You allocated 50KB to a process that only needs 35KB. 15KB is wasted *inside* the allocated region. Nobody else can use it.
+
+**External fragmentation**: You have 60KB free total, but it's in three 20KB chunks scattered around RAM. A process needing 50KB can't get it even though enough total space exists.
+
+**Compaction** — move all processes to one end to consolidate free space — is extremely expensive.
+
+---
+
+### Paging
+
+**Key idea**: Divide physical memory into fixed-size **frames**. Divide logical memory into same-size **pages**. Map pages to frames arbitrarily.
+
+Page size = Frame size (typically 4KB).
+
+A logical address has two parts:
+```
+[ Page Number (p) | Offset (d) ]
+```
+
+For 32-bit addresses with 4KB pages: 20 bits for page number, 12 bits for offset.
+
+Translation: look up `p` in the **page table** → get frame number `f` → physical address = `f × page_size + d`.
+
+The page table is stored in memory, indexed by page number. Each entry is a **Page Table Entry (PTE)**.
+
+**Eliminates external fragmentation**: Any free frame works for any page — no need for contiguous physical space.
+
+**May have internal fragmentation**: Last page of a process may be partially empty (max waste = page_size − 1 bytes).
+
+---
+
+### Page Table Entry (PTE) Bits
+
+Beyond the frame number, each PTE has:
+
+- **Valid/Present bit**: Is this page in physical memory? (0 = not present → page fault)
+- **Dirty bit**: Has this page been written to? (Used for write-back disk eviction)
+- **Reference bit**: Has this page been recently accessed? (Used for LRU approximation)
+- **Protection bits**: Read/Write/Execute permissions
+- **User/Supervisor bit**: Can user-mode code access this page?
+
+---
+
+### Multi-Level Page Tables
+
+Problem: For 32-bit address space with 4KB pages, the page table has 2^20 ≈ 1 million entries. At 4 bytes each, that's 4MB **per process**, even if the process uses only a tiny fraction of its address space.
+
+Solution: Page the page table itself.
+
+**Two-level page table (32-bit example):**
+```
+[10-bit outer index | 10-bit inner index | 12-bit offset]
+```
+
+The outer page directory (2^10 = 1024 entries) stores pointers to inner page tables. Inner page tables only exist for regions of address space actually in use. A process using only 1MB needs almost no inner tables.
+
+For 64-bit systems: 4-level page tables are standard (x86-64 uses 48-bit virtual addresses → four 9-bit indexes + 12-bit offset).
+
+---
+
+### TLB — Translation Lookaside Buffer
+
+Problem: Every memory access requires at least 2 memory accesses (one to walk the page table, one for the actual data). Fatal for performance.
+
+The TLB is a **hardware cache** for page table entries — typically 64–1024 entries, very fast (same access time as L1 cache).
+
+```
+CPU generates (p, d)
+↓
+Check TLB for p
+↓ hit (98-99%)        ↓ miss (~1-2%)
+Get frame f fast      Walk page table (slow)
+                      Update TLB
+                      ↓
+Physical addr = f × page_size + d
+Access memory
+```
+
+**TLB flush**: On context switch, TLB entries from the old process are invalid (different process = different page table = different mappings). Two options: flush the entire TLB (expensive), or use **ASIDs** (Address Space IDs) — tag each TLB entry with a process ID, so different processes' entries coexist. Linux uses ASIDs where hardware supports it.
+
+---
+
+### Segmentation
+
+Divide logical address space into **variable-size** segments based on logical units: code segment, data segment, stack, heap.
+
+```
+[ Segment Number (s) | Offset (d) ]
+```
+
+Segment table: maps `s` → (base address, limit).
+
+Translation: physical = `base[s] + d`, after verifying `d < limit[s]`.
+
+**Paging vs Segmentation**: Paging is OS-centric (fixed equal-size chunks, no fragmentation). Segmentation is programmer-centric (logical divisions of a program). Modern systems use **paged segmentation** or just pure paging with the OS artificially creating segments.
+
+---
+
+### 🎯 Interview Tips
+
+**Walk me through CPU virtual address → physical address:**
+
+CPU generates virtual address → split into page number (p) and offset (d) → check TLB for p → if TLB hit, get frame f immediately → if TLB miss, walk page table (possibly multi-level) to find f, update TLB → physical address = f × page_size + d → if PTE's valid bit is 0, page fault → OS brings page from disk.
+
+**Internal vs external fragmentation?**
+
+Internal: wasted space *inside* an allocated block (allocated more than needed). External: total free space sufficient but scattered in non-contiguous pieces. Paging eliminates external fragmentation but can have small internal fragmentation in the last page. Segmentation has external fragmentation but no internal.
+
+**Why multi-level page tables?**
+
+Flat page table for a 32-bit space needs 4MB regardless of how much the process actually uses. Multi-level tables are sparse — inner tables are only allocated for address ranges the process actually uses. Most processes use a tiny fraction of their potential address space.
+
+---
+
+## 6. Virtual Memory ⭐⭐⭐
+
+### The Core Idea
+
+A process doesn't need all its pages in physical memory simultaneously. Keep only actively used pages in RAM. Store the rest on disk (swap space).
+
+Each process gets the illusion of a massive address space (up to 2^64 bytes) even if physical RAM is 8GB.
+
+Benefits: More processes in memory simultaneously, processes can be larger than physical RAM, faster process startup.
+
+---
+
+### Demand Paging
+
+Don't load any pages when a process starts. Load each page only when it's first accessed (demanded). Pages not accessed = never loaded.
+
+---
+
+### Page Fault
+
+CPU accesses page p. PTE for p has valid bit = 0 (not in RAM):
+
+1. MMU raises a **page fault exception**
+2. OS takes control (page fault handler)
+3. OS verifies the access is legal (is this address in the process's valid range?)
+4. OS finds the page on disk (in swap partition, or in the executable file)
+5. OS finds a free frame (or evicts one using page replacement)
+6. OS reads the page from disk into the frame (disk I/O — expensive!)
+7. OS updates the PTE: set frame number, set valid bit = 1
+8. OS restarts the faulting instruction
+
+A page fault costs milliseconds (disk I/O). A normal memory access: nanoseconds. Page faults must be rare.
+
+---
+
+### Page Replacement Algorithms
+
+When there are no free frames: evict a page.
+
+---
+
+**FIFO** — evict the oldest page (longest in memory).
+
+Simple, but suffers from **Belady's anomaly**: with FIFO, giving a process *more* frames can *increase* page faults. Counterintuitive and unique to non-stack algorithms.
+
+---
+
+**Optimal (OPT)** — evict the page that won't be used for the longest time in the future.
+
+Impossible to implement (requires future knowledge). But it's the gold standard lower bound for comparison.
+
+---
+
+**LRU** — Least Recently Used — evict the page used farthest in the past.
+
+Exploits **temporal locality**: recently used pages will likely be used again. No Belady's anomaly.
+
+True LRU is expensive to implement in hardware. Two approaches:
+
+- **Counter-based**: Every PTE has a time counter. Update every access. Evict lowest counter. Expensive.
+- **Stack-based**: Move accessed page to top of a doubly-linked list. Bottom = LRU. O(1) for finding LRU.
+
+Both require hardware support for every memory access — too expensive in practice.
+
+---
+
+**Clock Algorithm (Second Chance)** — LRU approximation.
+
+Pages arranged in a circular buffer. Each has a **reference bit** (set to 1 by hardware on access).
+
+When evicting:
+1. Move clock hand forward
+2. If reference bit = 1: clear it (give it a second chance), advance
+3. If reference bit = 0: evict this page
+
+When a page is accessed, hardware sets its reference bit. The clock hand sweeps through, clearing bits. Pages that weren't used since the last sweep get evicted. This approximates LRU efficiently.
+
+---
+
+**Worked Example — Page Replacement:**
+
+```
+Reference string: 1 2 3 4 1 2 5 1 2 3 4 5
+Frames = 3
+
+FIFO:
+1 → [1]          FAULT
+2 → [1,2]        FAULT
+3 → [1,2,3]      FAULT
+4 → [4,2,3]      FAULT (evict 1)
+1 → [4,1,3]      FAULT (evict 2)
+2 → [4,1,2]      FAULT (evict 3)
+5 → [5,1,2]      FAULT (evict 4)
+1 → [5,1,2]      HIT
+2 → [5,1,2]      HIT
+3 → [3,1,2]      FAULT (evict 5)
+4 → [3,4,2]      FAULT (evict 1)
+5 → [3,4,5]      FAULT (evict 2)
+Total: 9 page faults
+
+OPT:
+1 → [1]                FAULT
+2 → [1,2]              FAULT
+3 → [1,2,3]            FAULT
+4: evict 3 (next used at pos 10, furthest)
+  → [1,2,4]            FAULT
+1 → [1,2,4]            HIT
+2 → [1,2,4]            HIT
+5: evict 4 (4 used at pos 11, 1 at pos 8, 2 at pos 9 → 4 is furthest)
+  → [1,2,5]            FAULT
+1,2 → HIT, HIT
+3: evict 5 (5 reused at pos 12, 1 at pos(none), 2 at(none))
+  → [1,2,3]            FAULT
+4: evict 1 or 3...     FAULT
+5: ...                 FAULT
+Total: ~7 page faults (optimal lower bound)
+```
+
+---
+
+### Thrashing
+
+**Thrashing** occurs when a process (or the system) spends more time paging than executing.
+
+How it happens:
+1. Process has fewer frames than its active working set
+2. It constantly page faults — brings in page A, which evicts page B that it needs next
+3. Almost no useful work gets done
+4. CPU utilization plummets
+5. OS scheduler sees low CPU utilization → thinks "system underloaded" → adds more processes
+6. Each process gets even fewer frames → more thrashing → CPU utilization → 0
+
+**Working Set Model**: Define a window Δ (e.g., last 10,000 references). The working set WS(t) = set of pages referenced in the last Δ references. Allocate enough frames to hold WS(t).
+
+If the sum of all working sets exceeds available frames: **suspend some processes** to give others enough frames.
+
+**Belady's Anomaly**: Adding more frames with FIFO can increase page faults. LRU and OPT are "stack algorithms" — adding frames never increases page faults.
+
+---
+
+### 🎯 Interview Tips
+
+**What happens on a page fault?**
+
+Page fault exception fires. OS validates the access. Finds the page on disk. Gets a free frame (evicting if needed — page replacement algorithm chooses victim). Reads page from disk (expensive I/O). Updates PTE (frame number, valid bit = 1). Restarts the faulting instruction.
+
+**Why LRU over FIFO?**
+
+FIFO ignores usage patterns entirely. LRU leverages temporal locality — recently used pages will likely be reused soon. LRU never suffers from Belady's anomaly. In practice, Clock (second-chance) approximates LRU efficiently.
+
+**What is thrashing and how do you fix it?**
+
+When a process has fewer frames than its working set, it page faults constantly and CPU utilization collapses. Fix: Track each process's working set. If total working sets exceed available frames, suspend some processes to give others enough frames. Or add more RAM. Or reduce the degree of multiprogramming.
+
+**What is Belady's anomaly?**
+
+With FIFO, increasing the number of frames can *increase* the number of page faults — counterintuitive. This doesn't happen with OPT or LRU (stack algorithms).
+
+---
+
+## Tier 2 — Important + Moderately Difficult
+
+---
+
+## 7. System Calls & OS Architecture
+
+### User Mode vs Kernel Mode
+
+Modern CPUs have at least two privilege levels:
+
+**User mode**: Restricted. Can't execute privileged instructions — can't directly access hardware, can't modify page tables, can't disable interrupts. All application code runs here.
+
+**Kernel mode** (supervisor mode): Unrestricted. Full hardware access. OS code runs here.
+
+Why? If any user program could directly access hardware, a buggy or malicious program could corrupt another process's memory, destroy file systems, or crash the machine. The OS is the protected intermediary.
+
+---
+
+### System Calls
+
+A system call is the only gateway from user space to kernel space. How it works:
+
+1. User program calls a library wrapper (e.g., `read()` in libc)
+2. Library sets up arguments (in registers or on the stack)
+3. Executes the special CPU instruction: `syscall` (x86-64), `svc #0` (ARM), `int 0x80` (old x86)
+4. CPU atomically switches to kernel mode, jumps to the OS's system call dispatcher
+5. Dispatcher uses the syscall number (in a register) to index the syscall table → jumps to the handler
+6. Handler validates arguments, performs the operation
+7. Handler sets the return value in a register
+8. CPU switches back to user mode
+9. Library function returns to user code
+
+System call categories: process control (`fork`, `exec`, `exit`, `wait`), file management (`open`, `read`, `write`, `close`), device management (`ioctl`), communication (`pipe`, `socket`, `send`, `recv`), information (`getpid`, `gettime`).
+
+---
+
+### Interrupts, Traps, Exceptions
+
+**Hardware interrupt**: Asynchronous signal from a hardware device. Timer fires, disk read completes, keyboard key pressed. CPU saves state, jumps to interrupt handler. Handler runs, CPU resumes where it left off.
+
+**Trap** (software interrupt): Synchronous, deliberately triggered by software. The `syscall` instruction is a trap. Divide by zero traps to the OS. Used as the mechanism for system calls.
+
+**Exception**: Synchronous error — page fault, invalid instruction, segmentation fault. OS decides how to handle: page faults are handled transparently (bring in the page); segfaults kill the process with SIGSEGV.
+
+**Interrupt Vector Table**: Array in memory where each entry is a handler address, indexed by interrupt number. When interrupt fires, hardware uses the interrupt number to look up and jump to the right handler.
+
+---
+
+### OS Architecture
+
+**Monolithic kernel**: The entire OS (scheduler, file system, device drivers, memory manager, network stack) runs as one big program in kernel mode. Driver bugs can crash the whole system. Fast — direct function calls between components. **Linux** is mostly monolithic.
+
+**Microkernel**: Only the bare minimum in kernel mode — IPC, basic memory mapping, minimal scheduling. Everything else (file systems, drivers) runs as user-space servers. Safer (driver crash doesn't crash kernel), more modular, but **slow** — every I/O operation requires multiple IPC round trips. **Mach**, **MINIX**, **QNX** are examples.
+
+**Hybrid kernel**: Some services in kernel for performance, some in user space for modularity. **Windows NT**, **macOS (XNU)** are hybrid.
+
+---
+
+### 🎯 Interview Tips
+
+**What happens when you call `write()` in C?**
+
+`write()` is a libc wrapper. It sets up the file descriptor, buffer pointer, and count in registers, then executes the `syscall` instruction. CPU switches to kernel mode. Kernel dispatches to the write system call handler. Handler validates the fd, copies data from user buffer to kernel space, schedules the write operation to the underlying device. Returns number of bytes written. CPU returns to user mode. `write()` returns.
+
+**Why can't user programs directly access hardware?**
+
+Privilege protection. Without it, any program could read another process's memory, overwrite kernel data structures, or permanently damage storage. The OS enforces isolation by being the only entity that can issue privileged instructions.
+
+---
+
+## 8. Inter-Process Communication (IPC)
+
+Processes are isolated by default. IPC lets them communicate.
+
+### Pipes
+
+Unidirectional byte stream. `ls | grep ".txt"` — `ls` writes to the pipe, `grep` reads from it. The OS manages a kernel buffer.
+
+**Anonymous pipes**: Created with `pipe()`, shared only between related processes (parent/child via fork). File descriptor is duplicated across fork.
+
+**Named pipes (FIFOs)**: Have a pathname in the file system. Any two processes can open them by name. Persist beyond the creating process.
+
+---
+
+### Shared Memory
+
+Two processes map the same physical memory region into their respective address spaces. Fastest IPC — after setup, no kernel involvement per access. But requires explicit synchronization (mutex/semaphore) to prevent race conditions.
+
+```
+shmget() → create/get a shared memory segment
+shmat()  → attach it to the process's address space
+```
+
+---
+
+### Message Queues
+
+Kernel-managed queue. Processes `msgsnd()` and `msgrcv()` messages. Allows selective receiving by message type. More structured than pipes.
+
+---
+
+### Sockets
+
+Bidirectional. Can communicate across machines (TCP/IP sockets) or locally (Unix domain sockets, much faster — no network stack). The foundation of all network programming.
+
+---
+
+### Signals
+
+Asynchronous notifications to a process. Software analogue of hardware interrupts. `SIGKILL` (terminate immediately, can't be caught), `SIGTERM` (terminate gracefully), `SIGSEGV` (segfault), `SIGALRM` (timer), `SIGCHLD` (child terminated).
+
+A process registers a signal handler with `signal()` or `sigaction()`. When the signal arrives, the process is interrupted and the handler runs. `SIGKILL` and `SIGSTOP` cannot be caught or ignored.
+
+---
+
+### Shared Memory vs Message Passing
+
+**Shared memory:**
+- Faster (no kernel overhead per access)
+- Requires explicit synchronization
+- Best for large, high-throughput data exchange
+
+**Message passing:**
+- Simpler (synchronization built in)
+- Kernel copies data on each operation
+- Better for structured protocols, distributed systems, and safety
+
+---
+
+### 🎯 Interview Tips
+
+**Pipe vs Socket?**
+
+Pipes are unidirectional, same machine only (anonymous: related processes; named: any processes). Sockets are bidirectional, work across machines over a network. Sockets are the general case.
+
+**Shared memory vs message queues?**
+
+Shared memory is faster (zero-copy once set up) but needs you to handle synchronization yourself. Message queues handle synchronization but copy data into kernel and back — slower. Use shared memory for bulk data, message queues for structured coordination.
+
+---
+
+## 9. File Systems
+
+### File Descriptors
+
+An integer that represents an open file *within a process*. 0=stdin, 1=stdout, 2=stderr. `open()` returns the lowest unused fd.
+
+The kernel maintains:
+- **Per-process fd table**: Maps fd integer → open file table entry
+- **System-wide open file table**: Tracks offset, flags, inode pointer (shared between related processes that forked)
+- **Inode table**: One entry per file (in memory for open files)
+
+---
+
+### Inodes
+
+An **inode** stores everything about a file except its name:
+- File size, type (regular, directory, symlink...)
+- Owner (UID), group (GID)
+- Permissions (rwxrwxrwx)
+- Timestamps: ctime, mtime, atime
+- Link count (how many directory entries point here)
+- **Block pointers**: where the file's actual data lives on disk
+
+The filename lives in the **directory** — a file that maps names → inode numbers.
+
+Why separate? Multiple filenames (hard links) can point to the same inode. The file isn't deleted until link count drops to 0 AND no process has it open.
+
+---
+
+### File Allocation — How Blocks Are Tracked
+
+**Contiguous**: File occupies consecutive disk blocks. Fast sequential read, easy direct access. External fragmentation, hard to extend.
+
+**Linked**: Each block has a pointer to the next. No external fragmentation. Slow random access (must follow the chain). One broken pointer = lost rest of file.
+
+**FAT (File Allocation Table)**: All the next-block pointers are stored in a table in memory, not in the blocks themselves. Enables O(1) random access (scan the FAT in memory to find the nth block).
+
+**Indexed allocation (Unix inodes)**: The inode contains block pointers directly and through indirection levels.
+
+```
+12 direct block pointers        → 12 × 4KB = 48KB
+1  single indirect pointer      → 1024 entries × 4KB = 4MB
+1  double indirect pointer      → 1024 × 1024 × 4KB = 4GB
+1  triple indirect pointer      → up to ~4TB
+```
+
+Calculation assumes 4KB blocks and 4-byte pointers (1024 pointers per block).
+
+---
+
+### Hard Links vs Symbolic Links
+
+**Hard link**: Another directory entry pointing to the same inode. Same file, different name. Link count increments. Can't cross file systems (inode numbers are per-filesystem). Deleting one name just decrements the link count.
+
+**Symbolic link (symlink)**: A separate file (its own inode) whose content is a path string. OS follows the path on access. Can cross file systems. Can be dangling (target deleted).
+
+```bash
+ln file1 hard_link       # hard link — same inode
+ln -s file1 soft_link    # symlink — separate inode pointing to "file1"
+```
+
+---
+
+### What Happens When You Open a File?
+
+Tracing `open("/home/zap/notes.txt", O_RDONLY)`:
+
+1. Start at root directory (inode #2, always)
+2. Look up `"home"` in root dir → find inode N for `/home`
+3. Look up `"zap"` in `/home` → find inode M for `/home/zap`
+4. Look up `"notes.txt"` in `/home/zap` → find inode K
+5. Load inode K, check permissions against requesting process's UID/GID
+6. Create entry in kernel's open file table (current offset = 0, flags, pointer to inode K)
+7. Create entry in process's fd table pointing to the open file table entry
+8. Return the fd integer
+
+Then `read(fd, buf, 100)`:
+1. Kernel follows fd → open file table → inode K
+2. Compute which disk block contains offset 0: `offset / block_size = block index`
+3. Follow inode's block pointers to find the physical disk block
+4. Read block into the page cache (if not already there)
+5. Copy data from page cache to user's `buf`
+6. Advance offset by 100
+
+---
+
+### 🎯 Interview Tips
+
+**What is an inode?**
+
+A disk data structure storing all file metadata except the filename: size, type, permissions, timestamps, owner, and block pointers. The filename → inode mapping lives in the directory.
+
+**Hard link vs symlink?**
+
+Hard link = another directory entry pointing to the same inode. Same physical file, different names. Can't cross filesystems. Symlink = separate file containing a path string. OS redirects on access. Can cross filesystems, can dangle if target is deleted.
+
+**What happens internally when you read a file?**
+
+fd lookup → open file table → inode → compute block offset → inode block pointers (direct/indirect) → check page cache → if cached, copy to user buffer; if not, read from disk into cache, then copy → advance file offset.
+
+---
+
+## 10. Disk & I/O Scheduling
+
+### HDD Structure
+
+- **Platters**: Spinning magnetic disks
+- **Tracks**: Concentric circles on each platter
+- **Sectors**: Smallest unit (512B or 4KB)
+- **Cylinders**: Same track across all platters
+- **Read/write heads**: On movable arms
+
+**Seek time**: Moving arm to the correct track. Dominant cost (~5-10ms).
+**Rotational latency**: Waiting for the sector to spin under the head (~4ms at 7200 RPM).
+**Transfer time**: Reading/writing the sector. Fastest part.
+
+Total access time ≈ seek + rotational + transfer.
+
+---
+
+### Disk Scheduling Algorithms
+
+Arm at position 50. Queue: 98, 183, 37, 122, 14, 124, 65, 67
+
+**FCFS**: Serve in arrival order. Total movement: 640. Simple, often terrible.
+
+**SSTF** (Shortest Seek Time First): Always serve the nearest request.
+50→65→67→98→122→124→183→37→14. Movement: ~236. Risk: **starvation** for far requests.
+
+**SCAN** (Elevator): Move in one direction, service all requests, reverse.
+Going up from 50: 65, 67, 98, 122, 124, 183. Reverse: 37, 14. More uniform.
+
+**C-SCAN** (Circular SCAN): Service only in one direction. At the far end, jump to the other end without servicing. More uniform waiting times — avoids the bias SCAN has toward the middle (serviced twice per sweep).
+
+**LOOK**: Like SCAN but reverses at the last request in each direction, not at the disk's physical end.
+
+**C-LOOK**: LOOK but circular. Most modern systems use LOOK or C-LOOK.
+
+SSDs have no moving parts — seek time and rotational latency don't exist. Any block is equally fast. For SSDs, NOOP or deadline scheduler is preferred.
+
+---
+
+### 🎯 Interview Tips
+
+**Why is SSTF not ideal?**
+
+Starvation. Requests at the extremes of the disk can wait indefinitely as the arm keeps servicing nearby requests. SCAN provides bounded waiting — every request is serviced within two passes.
+
+**SCAN vs C-SCAN?**
+
+SCAN reverses direction — requests near the middle are serviced twice per cycle (once going, once returning). C-SCAN only services going one way, then jumps back — more uniform average waiting time across the disk.
+
+---
+
+## 11. I/O & DMA
+
+### Device Controllers & Drivers
+
+Each hardware device has a **device controller** — hardware that manages the device and exposes registers to the CPU (control, status, data registers). The CPU commands a device by writing to its controller's registers.
+
+A **device driver** is OS software that knows the controller's interface. It translates generic OS I/O requests ("read 512 bytes from block 1000") into controller-specific register writes.
+
+---
+
+### I/O Methods
+
+**Polling (busy-wait)**: CPU repeatedly reads the device status register in a loop until done. Wastes CPU. Only reasonable for devices that complete in microseconds (e.g., some high-speed serial).
+
+**Interrupt-driven I/O**:
+1. CPU starts the operation (writes to controller registers)
+2. CPU does other work
+3. Device interrupts when done
+4. OS runs interrupt service routine (ISR), processes the result
+
+Much better than polling. But for bulk transfers (disk, network), you'd get an interrupt per block — too many interrupts.
+
+---
+
+### DMA — Direct Memory Access
+
+**CPU-driven I/O**: CPU copies every byte from device → memory. CPU burns cycles doing memory moves.
+
+**DMA**:
+1. CPU programs the DMA controller: source (device port), destination (memory address), transfer size, direction
+2. CPU goes off and does useful work
+3. DMA controller manages the entire transfer between device and memory directly
+4. When the transfer completes, DMA interrupts the CPU once
+5. CPU processes the single interrupt
+
+For a 4MB disk read: CPU-driven = millions of memory moves. DMA = one setup + one interrupt. Massive win.
+
+---
+
+### Buffering, Caching, Spooling
+
+**Single buffer**: OS buffer between user and device. Better than direct but still requires synchronization.
+
+**Double buffer**: Two buffers. While device fills buffer A, user processes buffer B. Then swap. Removes producer-consumer synchronization requirement for the fast path.
+
+**Circular buffer**: Ring of N buffers. Standard in modern systems.
+
+**Page cache**: All file data read from disk is cached in free RAM. Subsequent reads of the same data are served from memory. Writes are often write-back (written to cache, flushed to disk periodically or on `fsync()`). The page cache is *shared* across processes — two processes reading the same file share the same cached pages.
+
+**Spooling**: A disk queue for a device that can't interleave jobs (e.g., printer). Jobs from multiple processes are written to a spool on disk. A spooler daemon feeds them to the printer one at a time. Processes don't compete directly for the printer.
+
+---
+
+### 🎯 Interview Tips
+
+**DMA vs CPU-driven I/O?**
+
+CPU-driven I/O requires the CPU to be involved in every byte of transfer. DMA delegates the transfer to dedicated hardware — CPU only gets interrupted when the entire transfer is complete. For bulk I/O (disk, network), DMA is orders of magnitude more efficient.
+
+**What is the page cache and why does it matter?**
+
+It's the portion of RAM used to cache file system data. When you read a file, the OS reads it into the page cache and serves future reads from there without going to disk. It dramatically reduces disk I/O for repeated accesses. `free -h` on Linux shows most "used" memory is page cache — it's reclaimed when applications need RAM.
+
+---
+
+## Tier 3 — Advanced / Differentiators
+
+---
+
+## 12. Advanced Scheduling
+
+### Multilevel Queue
+
+Processes partitioned into groups: foreground (interactive), background (batch), system. Each group has its own queue with its own algorithm. Higher-priority queues get CPU preference.
+
+Example structure:
+- Queue 1: System processes (highest, small RR quantum)
+- Queue 2: Interactive processes (medium, larger RR quantum)
+- Queue 3: Batch processes (lowest, FCFS)
+
+Problem: starvation for lower queues if higher queues are always non-empty.
+
+---
+
+### Multilevel Feedback Queue (MLFQ)
+
+Like multilevel queue, but processes **migrate between queues** based on observed behavior.
+
+Rules (typical implementation):
+- New processes enter the highest-priority queue
+- If a process uses its full quantum, demote it to the next lower queue (it's CPU-bound)
+- If a process blocks before the quantum expires, keep it in the current queue (it's I/O-bound)
+- **Aging**: periodically boost all processes back to the top queue to prevent starvation
+
+This self-tunes. CPU-bound batch processes sink to low queues. Interactive processes that do short bursts stay in high queues — good response time without knowing burst times in advance.
+
+MLFQ is essentially what Linux's scheduler historically used and what most general-purpose OS schedulers approximate.
+
+---
+
+### Real-Time Scheduling
+
+**Hard real-time**: Deadlines are absolute. Missing one is a system failure (aircraft fly-by-wire, pacemakers, anti-lock brakes).
+
+**Soft real-time**: Missing a deadline degrades quality but isn't catastrophic (video streaming, audio, UI).
+
+**Rate Monotonic Scheduling (RMS)**: Static priority. Higher request frequency = higher priority. Provably optimal among static-priority preemptive algorithms. A set of n periodic tasks is schedulable if CPU utilization ≤ n(2^(1/n) − 1).
+
+**Earliest Deadline First (EDF)**: Dynamic priority. Process with the nearest absolute deadline gets the CPU. Optimal — can achieve 100% utilization while meeting all deadlines (if the set is feasible). Harder to implement.
+
+---
+
+### Priority Inversion & Solutions
+
+Classic scenario:
+- L (low priority) holds a mutex
+- H (high priority) wants the mutex, blocks
+- M (medium priority) is ready, preempts L
+- L can't release the mutex because M is running. H waits. M effectively blocks H.
+
+Real case: **Mars Pathfinder (1997)** — a low-priority meteorological data task held a mutex needed by the high-priority bus management task. Medium-priority tasks kept running, starving the low-priority task. Watchdog reset the spacecraft repeatedly.
+
+**Priority Inheritance**: When L holds a resource needed by H, L temporarily runs at H's priority until it releases the resource. Prevents M from preempting L.
+
+**Priority Ceiling Protocol**: Each resource is assigned a ceiling = the highest priority of any task that might use it. A task's priority is raised to the ceiling when it acquires the resource.
+
+---
+
+## 13. Advanced Synchronization
+
+### Peterson's Algorithm
+
+Software mutual exclusion for two processes, no hardware support:
+
+```
+int flag[2] = {false, false};
+int turn;
+
+// Process i (j = 1 - i):
+flag[i] = true;
+turn = j;                          // "you go first"
+while (flag[j] && turn == j) ;    // wait if other wants in AND it's their turn
+// CRITICAL SECTION
+flag[i] = false;
+```
+
+Correctly satisfies mutual exclusion, progress, and bounded waiting. However, modern CPUs with out-of-order execution and memory reordering can break this without explicit memory barriers (`fence` instructions).
+
+---
+
+### Test-and-Set (TAS)
+
+Hardware atomic instruction:
+```
+bool test_and_set(bool *target) {
+    bool rv = *target;
+    *target = true;
+    return rv;
+}
+```
+
+Atomically reads and sets to true. Spinlock with TAS:
+```
+while (test_and_set(&lock)) ;  // spin until acquired
+// CRITICAL SECTION
+lock = false;
+```
+
+Problem: No bounded waiting. A process can spin indefinitely if unlucky.
+
+---
+
+### Compare-and-Swap (CAS)
+
+More powerful:
+```
+int CAS(int *value, int expected, int new_value) {
+    if (*value == expected) {
+        *value = new_value;
+        return expected;
+    }
+    return *value;  // current value (didn't swap)
+}
+```
+
+Foundation of **lock-free data structures**. Optimistic concurrency: try to update; if the value has changed since you read it (CAS fails), retry.
+
+Lock-free advantages: no deadlocks possible, no priority inversion, better scalability on multi-core. Lock-free stacks, queues, and hash maps are used in high-performance systems (Java's `ConcurrentHashMap`, Linux's RCU).
+
+---
+
+## 14. Advanced Memory
+
+### Copy-on-Write (COW)
+
+After `fork()`, don't copy the parent's memory immediately. Mark all pages as **copy-on-write** in both parent's and child's page tables. Both point to the same physical frames (read-only).
+
+When either process writes to a COW page:
+1. Page fault (write to read-only page)
+2. OS detects COW flag
+3. OS copies the physical frame
+4. Updates the writing process's PTE to point to the new frame
+5. Resumes the write
+
+In practice, `fork()` is almost always followed by `exec()` — the child replaces its entire address space. With COW, `fork()` + `exec()` copies nothing — fork marks everything COW, exec discards everything. Near-zero cost.
+
+---
+
+### Memory-Mapped Files
+
+Map a file directly into the process's virtual address space with `mmap()`. Accessing those memory addresses reads/writes the file. No `read()`/`write()` system calls needed.
+
+Benefits: OS transparently handles buffering, caching, paging. Multiple processes mapping the same file share the same physical pages (implicit shared memory). Efficient for large files — only touched pages are loaded.
+
+Used everywhere: loading executables and shared libraries (`.so`/`.dll` are mmap'd, not copied), large dataset processing, SQLite, `malloc()` for large allocations.
+
+---
+
+### NUMA
+
+In multi-socket servers, each CPU socket has local RAM. Accessing local memory: ~50ns. Accessing another socket's memory: ~150ns.
+
+**NUMA-aware allocation**: Allocate memory on the same node as the CPU that will use it. Linux's `numactl` and the kernel's NUMA-aware allocator try to do this automatically.
+
+**NUMA scheduling**: Keep a process running on the same CPU socket as its memory. Migration is expensive if the memory doesn't follow.
+
+---
+
+### Page Cache
+
+The OS uses free RAM to cache disk data. Virtually all file reads go through the page cache. The page cache and process address space share the same pool of physical memory — a file-backed mmap'd page and a cached file read are the same thing.
+
+`sync()` / `fsync()` — flush dirty cache pages to disk. Critical for durability.
+
+---
+
+## 15. Advanced File Systems
+
+### The Crash Consistency Problem
+
+A single logical operation (e.g., append to a file) requires multiple disk writes:
+1. Write data to a new block
+2. Update inode's block pointers and size
+3. Update the bitmap (mark block as used)
+
+If power cuts between step 1 and step 2, the data is on disk but nothing points to it. Lost data, and the bitmap thinks the block is free.
+
+---
+
+### Journaling (Write-Ahead Logging)
+
+Before making any file system changes, write a **journal entry** describing the intended changes. Then apply the changes. Then mark the journal entry as committed.
+
+On crash recovery:
+- Incomplete journal entry: ignore it. File system is in the pre-operation state.
+- Complete journal entry but changes not applied: **replay** the journal.
+- Changes applied and journal committed: done.
+
+The journal commit (the last write) is the atomic decision point. ext4, NTFS, HFS+, APFS all use journaling.
+
+**Metadata journaling** (most common): Only journal metadata, not file data. Faster, but in an inconsistent ordering, you might get old data after a crash. Full journaling is safer but 2× write amplification.
+
+---
+
+### fsync
+
+`write()` returns when data is in the kernel page cache. The data isn't on disk yet. `fsync(fd)` blocks until ALL dirty pages for that file are flushed to physical disk. Critical for databases, write-ahead logs, any durability guarantee.
+
+This is why databases are slow — they call `fsync()` after every committed transaction.
+
+---
+
+### Log-Structured File Systems (LFS)
+
+Treat the entire disk as a sequential log. All writes (data AND metadata) are appended sequentially — never overwrite in-place.
+
+Pros: Every write is sequential → fast on HDD and flash. Great for write-heavy workloads. Simple crash recovery (replay the log).
+
+Cons: Reads require a separate index (inode map) to find the current location of each file's blocks. Needs **segment cleaning** (compaction / garbage collection) to reclaim space from outdated log segments.
+
+LFS principles are used in: SSDs' flash translation layers (FTL), Kafka, LevelDB/RocksDB, modern write-optimized databases.
+
+---
+
+## 16. OS Performance
+
+### Cache Locality
+
+**Temporal locality**: Recently accessed data will be accessed again soon. The entire cache hierarchy (L1/L2/L3) exploits this.
+
+**Spatial locality**: Data near a recently accessed location will be accessed soon. CPUs load entire **cache lines** (64 bytes) on each access — even if you only needed 4 bytes.
+
+**Practical implication**: Iterating a 2D array row-by-row (C row-major order) is dramatically faster than column-by-column. Row iteration is sequential in memory — spatial locality. Column iteration jumps by row_size bytes — cache miss on every access.
+
+```
+// Cache-friendly: rows are contiguous in memory
+for (i=0; i<N; i++)
+    for (j=0; j<M; j++)
+        sum += A[i][j];
+
+// Cache-unfriendly: each access jumps M elements forward
+for (j=0; j<M; j++)
+    for (i=0; i<N; i++)
+        sum += A[i][j];
+```
+
+---
+
+### Context-Switch Overhead
+
+Each context switch costs: saving/restoring registers (~100ns), potentially flushing/polluting the TLB (if no ASIDs), and **cache pollution** — the new process has a cold cache. Warm-up time is real.
+
+For high-throughput servers, this is why **event-driven async I/O** (one thread + `epoll`) can outperform a thread-per-connection model — no context switches for blocked threads, better cache utilization. Node.js, nginx, Redis all use this model.
+
+---
+
+### Memory Pressure & OOM
+
+When free RAM drops:
+1. OS starts reclaiming page cache (least recently used)
+2. If still insufficient, starts using swap
+3. Swap reads/writes are disk I/O → performance cliff
+4. More page faults → more I/O → positive feedback loop (thrashing)
+
+**OOM Killer**: When physical RAM is completely exhausted, Linux scores processes (combining RSS, swap usage, priority, whether it's the OOM killer's allowed target) and kills the highest-scorer. Can kill the wrong process. Tunable with `/proc/PID/oom_score_adj`.
+
+---
+
+### Scheduling Overhead
+
+With hundreds of runnable processes, the scheduler must quickly find the next one. Linux's **Completely Fair Scheduler (CFS)** uses a **red-black tree** keyed by each process's virtual runtime (how much CPU time it's gotten, weighted by priority). The process with the smallest virtual runtime (least CPU so far) is always at the leftmost node — O(1) to find. Insertion is O(log n). Provides near-perfect fairness.
+
+---
+
+### I/O Bottlenecks
+
+When processes mostly wait for I/O: CPU is idle, throughput suffers. Solutions:
+
+- **Async I/O + event loops** (`epoll`, `io_uring`): one thread manages many I/O operations in flight
+- **More threads/processes**: overlap I/O wait (works until context-switch overhead dominates)
+- **Faster storage**: SSD over HDD, NVMe over SATA (~10× latency reduction)
+- **Page cache**: warm cache eliminates most disk reads
+- **io_uring** (modern Linux): submits I/O operations without system calls in the hot path, ring buffer shared between kernel and userspace
+
+---
+
+## Final Interview Prep Checklist
+
+The topics you're most likely to be asked to solve/explain in an interview, ranked by frequency:
+
+**Solve by hand**: Banker's Algorithm, page replacement (FIFO/LRU/OPT), disk scheduling (SCAN/SSTF), CPU scheduling Gantt charts with waiting/turnaround time calculations.
+
+**Explain the mechanism**: Context switch step-by-step, page fault handler sequence, virtual address → physical address translation, what `fork()` + `exec()` does, what happens on `open()` + `read()`.
+
+**Distinguish concepts**: Mutex vs semaphore, spinlock vs mutex, process vs thread vs goroutine, concurrency vs parallelism, hard link vs symlink, SCAN vs C-SCAN, prevention vs avoidance vs detection.
+
+**Understand the tradeoffs**: Why threads are cheaper, why LRU beats FIFO, why multi-level page tables exist, why journaling exists, why DMA matters, shared memory vs message passing.
+
+**Know the classic problems cold**: Producer-consumer, readers-writers, dining philosophers — implementation, pitfalls, why certain orderings deadlock.
+
+---
+
+This covers all 16 topics with the depth you need. The intuition-first approach here should let you reconstruct the mechanics even if you forget the exact steps under pressure. The patterns recur: atomicity is fundamental, locality is universal, every tradeoff in OS design is between simplicity and performance.
